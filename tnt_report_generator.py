@@ -1147,6 +1147,9 @@ def update_summary(sheet: Sheet, count: int, source_ends: dict):
 
 def update_headlines(book: Book, dates: list[dt.date], ends: dict):
     sheet = book.sheet("Headline Figures")
+    # Row 5 includes a styled, intentionally blank percentage cell per date.
+    # Copy both styles explicitly, including into existing unformatted blanks.
+    total_styles = (sheet.cells[(5, 6)].style, sheet.cells[(5, 7)].style)
     count_formulas = {r: sheet.cells[(r, 6)].formula for r in range(5, 21)}
     percent_formulas = {r: sheet.cells[(r, 7)].formula for r in range(6, 21)}
     cumulative_percent = {r: sheet.cells[(r, 5)].formula for r in range(6, 21)}
@@ -1167,6 +1170,9 @@ def update_headlines(book: Book, dates: list[dt.date], ends: dict):
         sheet.set(4, col, excel_date(day), template_col=6)
         sheet.set(4, col + 1, "%", template_col=7)
         sheet.extra_columns.extend([(col, 6), (col + 1, 7)])
+        for offset, style in enumerate(total_styles):
+            sheet.set(5, col + offset, template_col=6 + offset)
+            sheet.cells[(5, col + offset)].style = style
         for row, formula in count_formulas.items():
             formula = Translator(extend_formula(formula, sheet.name, ends), origin=f"F{row}").translate_formula(f"{letter}{row}")
             sheet.set(row, col, formula=formula, template_col=6)
@@ -1257,7 +1263,7 @@ def default_folder_link(report_date: dt.date, earliest_visit: str) -> str:
     season_day = parse_date(earliest_visit)
     year = season_day.year if season_day.month >= 7 else season_day.year - 1
     return ("https://servelegalltd.sharepoint.com/:f:/r/sites/ServeLegal/Open%20Access/Media%20Compliance/TNT-SL-Data/Sent%20by%20SL/"
-            f"Season%20{year}-{str(year + 1)[-2:]}/Reports/{report_date.year}/{report_date:%m.%y}")
+            f"Season%20{year % 100:02d}-{(year + 1) % 100:02d}/Reports/{report_date.year}/{report_date:%m.%y}")
 
 
 def email_text(book: Book, new_tnt: list[dict], folder_link: str, report_date: dt.date):
@@ -1288,10 +1294,15 @@ def merge_root(game_id: str, merges: dict[str, str]) -> str:
 def rich_email_html(text: str) -> str:
     paragraphs = []
     for block in text.split("\n\n"):
-        escaped = html.escape(block).replace("\n", "<br>")
+        lines = []
+        for line in block.split("\n"):
+            escaped_line = html.escape(line)
+            if (re.fullmatch(r"\d{1,2}/\d{1,2}\s*[–-]\s*(?:\d+%|N/A)", line.strip())
+                    or line.startswith("SEASON TOTAL") or line.strip() == "Kind Regards,"):
+                escaped_line = "<strong>" + escaped_line + "</strong>"
+            lines.append(escaped_line)
+        escaped = "<br>".join(lines)
         escaped = re.sub(r'(\d{2}\.\d{2}) \((https?://[^\s<>]+)\)', lambda m: '<a href="' + m[2] + '" style="color:#0563c1;text-decoration:underline">' + m[1] + '</a>', escaped)
-        if block.startswith("SEASON TOTAL"):
-            escaped = "<strong>" + escaped + "</strong>"
         paragraphs.append('<p style="margin:0 0 14px">' + escaped + '</p>')
     return '<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000">' + "".join(paragraphs) + '</div>'
 
@@ -1531,58 +1542,9 @@ def main():
         roots = {key: merge_root(key, merges) for key in ordered}
     except ReportError as error:
         st.error(str(error)); return
-    assignments = assign_games(plan.records, games)
-    ambiguous = [r for r in plan.records if not assignments[r["internal_id"]]]
-    game_overrides = {}
-    if ambiguous:
-        st.warning(f"Choose a game for {len(ambiguous)} audit(s) with insufficient or conflicting fixture details.")
-        pending = pd.DataFrame([{"Audit ID": r["internal_id"], "Visit date": parse_date(r["_visit_date"]).strftime("%d/%m/%Y"), "Site": r.get("site_name", ""), "Visit Info": r.get("visit_info", ""), "Fixture answer": question(r, 1410), "Game": ""} for r in ambiguous])
-        edited = st.data_editor(pending, hide_index=True, use_container_width=True, disabled=["Audit ID", "Visit date", "Site", "Visit Info", "Fixture answer"], column_config={"Game": st.column_config.SelectboxColumn("Game", options=[""] + [games[k].label for k in ordered], required=True)}, key="pending_games_" + digest + hashlib.sha256("".join(ordered).encode()).hexdigest()[:8])
-        labels = {games[key].label: key for key in ordered}
-        game_overrides = {row["Audit ID"]: labels.get(clean(row["Game"]), "") for row in edited.to_dict("records")}
-    audit_counts = collections.Counter()
-    for record in plan.records:
-        game = game_overrides.get(record["internal_id"]) or assignments.get(record["internal_id"])
-        if game:
-            audit_counts[roots.get(game, game)] += 1
-    root_games = sorted(set(roots.values()), key=lambda k: (games[k].date, games[k].kickoff, games[k].fixture))
-    competitions = {}
-    remembered_competitions = st.session_state.setdefault("competition_values_" + digest, {})
-    for old_key, root in roots.items():
-        if not remembered_competitions.get(root) and remembered_competitions.get(old_key):
-            remembered_competitions[root] = remembered_competitions[old_key]
-    if root_games:
-        st.subheader("Competitions")
-        st.caption("Enter the competition once for each game. It applies to all audits assigned to that game.")
-        table = pd.DataFrame([{"Game ID": key, "Date": parse_date(games[key].date).strftime("%d/%m/%Y"), "Kick-off": games[key].kickoff, "Game": fixture_display(games[key].fixture), "Audits": audit_counts[key], "Competition": remembered_competitions.get(key, "")} for key in root_games])
-        edited = st.data_editor(table, hide_index=True, use_container_width=True, disabled=["Game ID", "Date", "Kick-off", "Game", "Audits"], column_config={"Game ID": None, "Competition": st.column_config.TextColumn("Competition", required=True, width="large")}, key="competitions_" + digest + hashlib.sha256("".join(root_games).encode()).hexdigest()[:8])
-        competitions = {row["Game ID"]: clean(row["Competition"]) for row in edited.to_dict("records")}
-        remembered_competitions.update(competitions)
-    providers = {}
-    orders = sorted({clean(r["order_internal_id"]) for r in plan.records})
-    unresolved = []
-    for order in orders:
-        records = [r for r in plan.records if clean(r["order_internal_id"]) == order]
-        if any(r["_provider_conflict"] or not (r["_direct_provider"] or plan.order_providers.get(order)) for r in records):
-            unresolved.append(order)
-    if unresolved:
-        st.subheader("Broadcasters")
-        st.caption("The exported answers do not identify a single broadcaster for every audit in these orders.")
-        for order in unresolved:
-            providers[order] = st.selectbox(f"Broadcaster for {order or '(order ID blank)'}", ["", "TNT", "Amazon"], key="provider_" + digest + order)
-    if orders:
-        with st.expander("Review detected broadcasters"):
-            for order in orders:
-                if order in unresolved:
-                    continue
-                detected = plan.order_providers.get(order) or "Mixed: identified per audit"
-                st.write(f"{order}: {detected}")
-                override = st.selectbox(f"Override {order}", ["Use detected broadcaster", "TNT", "Amazon"], key="provider_override_" + digest + order)
-                if override != "Use detected broadcaster":
-                    providers["override:" + order] = override
-    reference_overrides = {}
+    reference_rows = []
+    site_digest = "none"
     if plan.references:
-        st.subheader("Store references")
         reference_rows = [dict(r) for r in plan.references]
         need_city = any(not clean(r["city"]) for r in reference_rows)
         site_digest = "none"
@@ -1598,30 +1560,91 @@ def main():
                             reference["city"] = by_id.get(reference["site_id"]) or by_code.get(reference["code"], "")
                 except ReportError as error:
                     st.error(str(error)); return
-        st.caption("New priorities default to Medium. Override the priority or complete a missing city below.")
-        priority_values = st.session_state.setdefault("priority_values_" + digest, {})
-        table = pd.DataFrame([{"Code": r["code"], "Site": r["name"], "Priority": priority_values.get(r["code"], r["priority"]), "City": r["city"]} for r in reference_rows])
-        edited = st.data_editor(table, hide_index=True, use_container_width=True, disabled=["Code", "Site"], column_config={"Priority": st.column_config.TextColumn("Priority", required=True), "City": st.column_config.TextColumn("City", required=True)}, key="references_" + digest + site_digest)
-        reference_overrides = {r["Code"]: {"priority": clean(r["Priority"]), "city": clean(r["City"])} for r in edited.to_dict("records")}
-        priority_values.update({code: values["priority"] for code, values in reference_overrides.items()})
-    with st.expander("Email folder link"):
-        folder = st.text_input("Report folder", value=default_folder_link(report_date, plan.earliest_visit), key="folder_" + digest + report_date.isoformat())
-    missing_competitions = [key for key in root_games if not competitions.get(key)]
-    missing_assignments = [r for r in ambiguous if not game_overrides.get(r["internal_id"])]
-    missing_providers = [order for order in unresolved if not providers.get(order)]
-    missing_refs = [r for r in plan.references if not clean(reference_overrides.get(r["code"], {}).get("city", r["city"])) or not clean(reference_overrides.get(r["code"], {}).get("priority", r["priority"]))]
-    ready = not (missing_competitions or missing_assignments or missing_providers or missing_refs)
-    if not ready:
-        todo = []
-        if missing_competitions: todo.append("competitions")
-        if missing_assignments: todo.append("game assignments")
-        if missing_providers: todo.append("broadcasters")
-        if missing_refs: todo.append("reference cities/priorities")
-        st.info("Complete the " + ", ".join(todo) + " to generate the reports.")
+    # Submit the entire configuration together, including the active editor cell.
+    with st.form("report_configuration_" + digest):
+        assignments = assign_games(plan.records, games)
+        ambiguous = [r for r in plan.records if not assignments[r["internal_id"]]]
+        game_overrides = {}
+        if ambiguous:
+            st.warning(f"Choose a game for {len(ambiguous)} audit(s) with insufficient or conflicting fixture details.")
+            pending = pd.DataFrame([{"Audit ID": r["internal_id"], "Visit date": parse_date(r["_visit_date"]).strftime("%d/%m/%Y"), "Site": r.get("site_name", ""), "Visit Info": r.get("visit_info", ""), "Fixture answer": question(r, 1410), "Game": ""} for r in ambiguous])
+            edited = st.data_editor(pending, hide_index=True, use_container_width=True, disabled=["Audit ID", "Visit date", "Site", "Visit Info", "Fixture answer"], column_config={"Game": st.column_config.SelectboxColumn("Game", options=[""] + [games[k].label for k in ordered], required=True)}, key="pending_games_" + digest + hashlib.sha256("".join(ordered).encode()).hexdigest()[:8])
+            labels = {games[key].label: key for key in ordered}
+            game_overrides = {row["Audit ID"]: labels.get(clean(row["Game"]), "") for row in edited.to_dict("records")}
+        audit_counts = collections.Counter()
+        for record in plan.records:
+            game = game_overrides.get(record["internal_id"]) or assignments.get(record["internal_id"])
+            if game:
+                audit_counts[roots.get(game, game)] += 1
+        if ambiguous and audit_counts:
+            st.caption("Assigned audits: " + "; ".join(f"{games[key].label}: {audit_counts[key]}" for key in sorted(audit_counts)))
+        root_games = sorted(set(roots.values()), key=lambda k: (games[k].date, games[k].kickoff, games[k].fixture))
+        competitions = {}
+        remembered_competitions = st.session_state.setdefault("competition_values_" + digest, {})
+        for old_key, root in roots.items():
+            if not remembered_competitions.get(root) and remembered_competitions.get(old_key):
+                remembered_competitions[root] = remembered_competitions[old_key]
+        if root_games:
+            st.subheader("Competitions")
+            st.caption("Enter the competition once for each game. It applies to all audits assigned to that game.")
+            table = pd.DataFrame([{"Game ID": key, "Date": parse_date(games[key].date).strftime("%d/%m/%Y"), "Kick-off": games[key].kickoff, "Game": fixture_display(games[key].fixture), "Competition": remembered_competitions.get(key, "")} for key in root_games])
+            editor_key = "competitions_" + digest + hashlib.sha256("".join(root_games).encode()).hexdigest()[:8]
+            table = st.session_state.setdefault(editor_key + "_base", table)
+            edited = st.data_editor(table, hide_index=True, use_container_width=True, disabled=["Game ID", "Date", "Kick-off", "Game"], column_config={"Game ID": None, "Competition": st.column_config.TextColumn("Competition", required=True, width="large")}, key=editor_key)
+            competitions = {row["Game ID"]: clean(row["Competition"]) for row in edited.to_dict("records")}
+            remembered_competitions.update(competitions)
+        providers = {}
+        orders = sorted({clean(r["order_internal_id"]) for r in plan.records})
+        unresolved = []
+        for order in orders:
+            records = [r for r in plan.records if clean(r["order_internal_id"]) == order]
+            if any(r["_provider_conflict"] or not (r["_direct_provider"] or plan.order_providers.get(order)) for r in records):
+                unresolved.append(order)
+        if unresolved:
+            st.subheader("Broadcasters")
+            st.caption("The exported answers do not identify a single broadcaster for every audit in these orders.")
+            for order in unresolved:
+                providers[order] = st.selectbox(f"Broadcaster for {order or '(order ID blank)'}", ["", "TNT", "Amazon"], key="provider_" + digest + order)
+        if orders:
+            with st.expander("Review detected broadcasters"):
+                for order in orders:
+                    if order in unresolved:
+                        continue
+                    detected = plan.order_providers.get(order) or "Mixed: identified per audit"
+                    st.write(f"{order}: {detected}")
+                    override = st.selectbox(f"Override {order}", ["Use detected broadcaster", "TNT", "Amazon"], key="provider_override_" + digest + order)
+                    if override != "Use detected broadcaster":
+                        providers["override:" + order] = override
+        reference_overrides = {}
+        if plan.references:
+            st.subheader("Store references")
+            st.caption("New priorities default to Medium. Override the priority or complete a missing city below.")
+            priority_values = st.session_state.setdefault("priority_values_" + digest, {})
+            table = pd.DataFrame([{"Code": r["code"], "Site": r["name"], "Priority": priority_values.get(r["code"], r["priority"]), "City": r["city"]} for r in reference_rows])
+            editor_key = "references_" + digest + site_digest
+            table = st.session_state.setdefault(editor_key + "_base", table)
+            edited = st.data_editor(table, hide_index=True, use_container_width=True, disabled=["Code", "Site"], column_config={"Priority": st.column_config.TextColumn("Priority", required=True), "City": st.column_config.TextColumn("City", required=True)}, key=editor_key)
+            reference_overrides = {r["Code"]: {"priority": clean(r["Priority"]), "city": clean(r["City"])} for r in edited.to_dict("records")}
+            priority_values.update({code: values["priority"] for code, values in reference_overrides.items()})
+        with st.expander("Email folder link"):
+            folder = st.text_input("Report folder", value=default_folder_link(report_date, plan.earliest_visit), key="folder_v2_" + digest + report_date.isoformat())
+        missing_competitions = [key for key in root_games if not competitions.get(key)]
+        missing_assignments = [r for r in ambiguous if not game_overrides.get(r["internal_id"])]
+        missing_providers = [order for order in unresolved if not providers.get(order)]
+        missing_refs = [r for r in plan.references if not clean(reference_overrides.get(r["code"], {}).get("city", r["city"])) or not clean(reference_overrides.get(r["code"], {}).get("priority", r["priority"]))]
+        ready = not (missing_competitions or missing_assignments or missing_providers or missing_refs)
+        if not ready:
+            todo = []
+            if missing_competitions: todo.append("competitions")
+            if missing_assignments: todo.append("game assignments")
+            if missing_providers: todo.append("broadcasters")
+            if missing_refs: todo.append("reference cities/priorities")
+            st.info("Complete the " + ", ".join(todo) + " to generate the reports.")
+        submitted = st.form_submit_button("Generate reports", type="primary")
     configuration = {"digest": digest, "date": report_date.isoformat(), "competitions": competitions, "providers": providers, "assignments": game_overrides, "merges": merges, "references": reference_overrides, "folder": folder}
     config_key = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
     output_key = "generated_reports_" + digest
-    if st.button("Generate reports", type="primary", disabled=not ready):
+    if submitted and ready:
         try:
             with st.spinner("Generating the LIVE report, client report and email…"):
                 with generation_lock():
