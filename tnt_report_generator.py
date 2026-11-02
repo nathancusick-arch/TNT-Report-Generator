@@ -5,6 +5,7 @@ import copy
 import csv
 import datetime as dt
 import hashlib
+import html
 import io
 import json
 import math
@@ -39,6 +40,32 @@ MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 class ReportError(ValueError):
     """A validation problem that can be displayed directly to the operator."""
+
+
+def xml_fragment(element: ET.Element) -> str:
+    """Write worksheet fragments independently of ET's global prefix registry.
+
+    Streamlit and other libraries may register 's' instead of 'ns0'. Main-sheet
+    element names inherit the surrounding worksheet namespace; qualified
+    attributes retain their automatically declared namespaces.
+    """
+    element = copy.deepcopy(element)
+    for node in element.iter():
+        if isinstance(node.tag, str) and node.tag.startswith("{" + NS + "}"):
+            node.tag = node.tag[len(NS) + 2:]
+    return ET.tostring(element, encoding="unicode")
+
+
+def validate_xlsx(content: bytes):
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            for name in archive.namelist():
+                if name.endswith((".xml", ".rels")):
+                    with archive.open(name) as part:
+                        for _, element in ET.iterparse(part, events=("end",)):
+                            element.clear()
+    except (ET.ParseError, zipfile.BadZipFile) as error:
+        raise ReportError(f"The generated workbook failed its integrity check: {error}") from error
 
 
 def clean(value: Any) -> str:
@@ -261,7 +288,7 @@ class Sheet:
         for row_number in sorted(self.rows):
             if end_row is not None and row_number > end_row:
                 continue
-            opening = ET.tostring(ET.Element(Q("row"), self.rows[row_number]), encoding="unicode").replace("ns0:", "").replace(":ns0", "").replace(f' xmlns="{NS}"', "", 1)
+            opening = xml_fragment(ET.Element(Q("row"), self.rows[row_number]))
             parts = [opening[:-2] + ">"]
             for col in sorted(self.row_columns[row_number]):
                 source = self.cells.get((row_number, col))
@@ -277,7 +304,7 @@ class Sheet:
                 if any(key.startswith("{") for key in attrs):
                     node = ET.Element(Q("c"), attrs)
                     self._write_node(Cell(node=node), value, formula)
-                    parts.append(ET.tostring(node, encoding="unicode").replace("ns0:", "").replace(":ns0", "").replace(f' xmlns="{NS}"', "", 1))
+                    parts.append(xml_fragment(node))
                     continue
                 prefix = "<c " + " ".join(key + "=" + quoteattr(str(val)) for key, val in attrs.items())
                 f = "<f>" + escape(formula.lstrip("=")) + "</f>" if formula else ""
@@ -323,8 +350,8 @@ class Sheet:
                     if source_col is not None:
                         new = copy.deepcopy(source_col)
                         new.set("min", str(target)); new.set("max", str(target)); columns.append(new)
-                text = ET.tostring(columns, encoding="unicode").replace("ns0:", "").replace(":ns0", "").replace(f' xmlns="{NS}"', "", 1)
-                xml = re.sub(r"<cols>.*?</cols>", lambda _: text, xml, count=1, flags=re.S)
+                text = xml_fragment(columns)
+                xml = re.sub(r"<(?:[\w.-]+:)?cols\b[^>]*>.*?</(?:[\w.-]+:)?cols>", lambda _: text, xml, count=1, flags=re.S)
         if values_only:
             xml = re.sub(r"<legacyDrawing\b[^>]*/>", "", xml)
         prefix, suffix = xml.split("__TNT_SHEET_DATA__", 1)
@@ -360,7 +387,7 @@ class Book:
                     inline = ET.Element(Q("is"))
                     for child in item:
                         inline.append(copy.deepcopy(child))
-                    self.rich_strings[index] = ET.tostring(inline, encoding="unicode").replace("ns0:", "").replace(":ns0", "").replace(f' xmlns="{NS}"', "", 1)
+                    self.rich_strings[index] = xml_fragment(inline)
         self.loaded: dict[str, Sheet] = {}
 
     def sheet(self, name: str) -> Sheet:
@@ -1157,7 +1184,7 @@ def client_bytes(book: Book, counts: dict[str, int]) -> bytes:
     selected = (["Invoicing"] if "Invoicing" in book.paths else []) + list(CLIENT_SHEETS)
     files = {}
     rels = ET.Element("Relationships", {"xmlns": PKG})
-    workbook = ET.Element(Q("workbook"), {"xmlns:r": REL})
+    workbook = ET.Element(Q("workbook"))
     views = ET.SubElement(workbook, Q("bookViews"))
     ET.SubElement(views, Q("workbookView"), {"activeTab": str(selected.index("Weekly Summary Table"))})
     sheets = ET.SubElement(workbook, Q("sheets"))
@@ -1245,7 +1272,7 @@ def email_text(book: Book, new_tnt: list[dict], folder_link: str, report_date: d
     lines += [f"{parse_date(day):%d/%m} – {rate(day)}" for day in periods]
     if not periods:
         lines.append("No new TNT audits were added this week.")
-    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues.", "", "Kind Regards,"]
+    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues."]
     return "\n".join(lines)
 
 
@@ -1256,6 +1283,57 @@ def merge_root(game_id: str, merges: dict[str, str]) -> str:
             raise ReportError("Game grouping contains a loop. Keep one game as the final destination.")
         seen.add(game_id); game_id = merges[game_id]
     return game_id
+
+
+def rich_email_html(text: str) -> str:
+    paragraphs = []
+    for block in text.split("\n\n"):
+        escaped = html.escape(block).replace("\n", "<br>")
+        escaped = re.sub(r'(\d{2}\.\d{2}) \((https?://[^\s<>]+)\)', lambda m: '<a href="' + m[2] + '" style="color:#0563c1;text-decoration:underline">' + m[1] + '</a>', escaped)
+        if block.startswith("SEASON TOTAL"):
+            escaped = "<strong>" + escaped + "</strong>"
+        paragraphs.append('<p style="margin:0 0 14px">' + escaped + '</p>')
+    return '<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000">' + "".join(paragraphs) + '</div>'
+
+
+def email_copy_component(text: str) -> str:
+    rich = rich_email_html(text)
+    # JSON is placed in script data: escape '<' so a supplied URL cannot close it.
+    rich_json = json.dumps(rich).replace("<", "\\u003c")
+    return '''<!doctype html><html><head><meta charset="utf-8"><style>
+    body{font-family:Arial,sans-serif;margin:0;padding:4px;color:#222}
+    button{font-size:14px;padding:9px 15px;background:#fff;border:1px solid #aaa;
+    border-radius:6px;cursor:pointer;margin-bottom:12px}#status{margin-left:12px;font-size:13px}
+    #preview{padding:14px;border:1px solid #ddd;border-radius:6px;background:white}
+    </style></head><body><button id="copy" type="button">Copy email for Outlook</button>
+    <span id="status" role="status"></span><div id="preview" contenteditable="true" spellcheck="false">''' + rich + '''</div>
+    <script>
+    const htmlBody = ''' + rich_json + ''';
+    const preview = document.getElementById('preview');
+    function selectionCopy(){
+      preview.focus();
+      const range=document.createRange();range.selectNodeContents(preview);
+      const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+      const ok=document.execCommand('copy');
+      if(ok)selection.removeAllRanges();return ok;
+    }
+    document.getElementById('copy').addEventListener('click',async()=>{
+      const status=document.getElementById('status');
+      // The synchronous selection route works inside Streamlit's iframe and
+      // copies native HTML. Keep async ClipboardItem as the alternate route.
+      let copied=false;try{copied=selectionCopy();}catch(error){}
+      if(!copied){try{
+        await navigator.clipboard.write([new ClipboardItem({
+          'text/html':new Blob([preview.innerHTML],{type:'text/html'}),
+          'text/plain':new Blob([preview.innerText],{type:'text/plain'})
+        })]);copied=true;
+      }catch(error){}}
+      status.textContent=copied?'Copied — paste into Outlook.':
+        'Select the email below and press Ctrl+C, then paste into Outlook.';
+      if(!copied){const r=document.createRange();r.selectNodeContents(preview);
+        const s=window.getSelection();s.removeAllRanges();s.addRange(r);}
+    });
+    </script></body></html>'''
 
 
 def generate_reports(previous_bytes: bytes, plan: Plan, competitions: dict[str, str], *, report_date: dt.date, reference_overrides: dict[str, dict] | None = None, provider_overrides: dict[str, str] | None = None, game_overrides: dict[str, str] | None = None, custom_games: dict[str, Game] | None = None, merges: dict[str, str] | None = None, folder_link: str = ""):
@@ -1355,6 +1433,8 @@ def generate_reports(previous_bytes: bytes, plan: Plan, competitions: dict[str, 
     email = email_text(book, tnt_records, folder_link or default_folder_link(report_date, plan.earliest_visit), report_date)
     live = book.live_bytes()
     client = client_bytes(book, counts)
+    validate_xlsx(live)
+    validate_xlsx(client)
     book.archive.close()
     book.loaded.clear()
     return {"live": live, "client": client, "email": email, "counts": counts, "new_tnt": len(tnt_records), "new_amazon": len(amazon_records), "skipped": plan.skipped, "live_name": f"TNT Sports Weekly Report {report_date:%d.%m.%y} LIVE.xlsx", "client_name": f"TNT Sports Weekly Report {report_date:%d.%m.%y}.xlsx"}
@@ -1558,8 +1638,9 @@ def main():
         left.download_button("Download updated LIVE report", output["live"], file_name=output["live_name"], mime=MIME_XLSX, on_click="ignore", use_container_width=True)
         right.download_button("Download client report", output["client"], file_name=output["client_name"], mime=MIME_XLSX, on_click="ignore", use_container_width=True)
         st.subheader("Email text")
-        st.caption("Use the copy button in the top-right corner of the text below.")
-        st.code(output["email"], language=None)
+        import streamlit.components.v1 as components
+        st.caption("Copy the formatted email below, then paste it into a new Outlook message.")
+        components.html(email_copy_component(output["email"]), height=600, scrolling=True)
 
 
 # Old export titles corresponding to the IDs in new exports. Provider variants
