@@ -4,6 +4,7 @@ import collections
 import copy
 import csv
 import datetime as dt
+from difflib import SequenceMatcher
 import hashlib
 import html
 import io
@@ -845,7 +846,9 @@ def coalesce_questions(record, ids, provider):
 def canonical_fixture(value: str) -> str:
     value = unicodedata.normalize("NFKC", clean(value)).replace("\u200b", "")
     value = re.sub(r"\[[^\]]*\]", " ", value).replace("*", "")
-    value = re.split(r"\s*-?\s*(?:positive(?:\s+site)?|pos)\s+confirmed\b", value, maxsplit=1, flags=re.I)[0]
+    # These are venue-status notes, not part of either team's name. Include
+    # the abbreviated/misspelled forms found in exports, with or without a dash.
+    value = re.split(r"(?:\s+[-–—:]?\s*|[-–—:]\s*)(?:(?:possible|possibly)\s+)?(?:positive|positve|postive|pos)\b", value, maxsplit=1, flags=re.I)[0]
     value = re.sub(r"\s+(?:TNT(?:\s+Sports?)?|Amazon(?:\s+Prime)?)\s*\d+\s*$", "", value, flags=re.I)
     value = re.sub(r"\b(?:vs\.?|versus)\b", "v", value, flags=re.I)
     value = re.sub(r"\s+v\.?\s+", " v ", value, flags=re.I)
@@ -874,12 +877,14 @@ class Game:
 
 
 def game_from_visit_info(value: str) -> Game | None:
-    match = re.match(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})\s+(.+)", value)
+    match = re.match(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s+(?:(\d{1,2}:\d{2})\s+)?(.+)", value)
     if not match:
         return None
     fixture = canonical_fixture(match[3])
     if not re.search(r"\S\s+v\s+\S", fixture):
         return None
+    if not match[2]:
+        return Game(parse_date(match[1]).isoformat(), "", fixture)
     hour, minute = map(int, match[2].split(":"))
     if hour > 23 or minute > 59:
         raise ReportError(f"Invalid kick-off time in Visit Info: {match[2]}")
@@ -899,6 +904,67 @@ class Plan:
     earliest_visit: str
 
 
+def fixture_matches(left: str, right: str, *, allow_reverse: bool = False) -> bool:
+    """Compare teams conservatively; never use similarity of the whole fixture.
+
+    A small spelling variation is accepted only when the other team matches
+    exactly. Candidate resolution below still requires a single matching game.
+    """
+    def teams(value):
+        parts = canonical_fixture(value).split(" v ")
+        return tuple(re.sub(r"[^a-z0-9]", "", "".join(
+            c for c in unicodedata.normalize("NFKD", part)
+            if not unicodedata.combining(c))) for part in parts)
+    a, b = teams(left), teams(right)
+    if len(a) != 2 or len(b) != 2 or not all(a + b):
+        return False
+    def same_pair(x, y):
+        if x == y:
+            return True
+        for fixed, other in ((0, 1), (1, 0)):
+            if (x[fixed] == y[fixed] and min(len(x[other]), len(y[other])) >= 6
+                    and SequenceMatcher(None, x[other], y[other]).ratio() >= 0.88):
+                return True
+        return False
+    return same_pair(a, b) or (allow_reverse and same_pair(a, b[::-1]))
+
+
+def matching_game_ids(game: Game, games: dict[str, Game], *, allow_reverse: bool = False) -> list[str]:
+    candidates = {key: other for key, other in games.items()
+                  if other.date == game.date and
+                  (not game.kickoff or not other.kickoff or other.kickoff == game.kickoff)}
+    exact = [key for key, other in candidates.items() if other.fixture == game.fixture]
+    if exact:
+        return exact
+    return [key for key, other in candidates.items()
+            if fixture_matches(game.fixture, other.fixture, allow_reverse=allow_reverse)]
+
+
+def collect_games(records: list[dict]) -> dict[str, Game]:
+    # The common scheduled spelling is the representative. Process explicit
+    # kick-offs first so missing times attach only to an unambiguous fixture.
+    scheduled = collections.Counter(game for record in records
+                                    if (game := game_from_visit_info(record.get("visit_info", ""))))
+    games = {}
+    for game in sorted(scheduled, key=lambda game: (not bool(game.kickoff), -scheduled[game], game.date, game.kickoff, game.fixture)):
+        candidates = matching_game_ids(game, games)
+        if not candidates or (game.kickoff and len(candidates) > 1):
+            games[game.id] = game
+    # Fixture answers may reverse home/away or contain a small typo. They do
+    # not create another competition row if the schedule already covers them.
+    fallback = collections.Counter()
+    for record in records:
+        if game_from_visit_info(record.get("visit_info", "")):
+            continue
+        fixture = canonical_fixture(question(record, 1410))
+        if re.search(r"\S\s+v\s+\S", fixture):
+            fallback[Game(record["_visit_date"], "", fixture)] += 1
+    for game in sorted(fallback, key=lambda game: (-fallback[game], game.date, game.fixture)):
+        if not matching_game_ids(game, games, allow_reverse=True):
+            games[game.id] = game
+    return games
+
+
 def assign_games(records: list[dict], games: dict[str, Game]) -> dict[str, str | None]:
     assignments = {}
     for record in records:
@@ -906,13 +972,14 @@ def assign_games(records: list[dict], games: dict[str, Game]) -> dict[str, str |
         if parsed and parsed.id in games:
             assignments[record["internal_id"]] = parsed.id
             continue
-        day = record["_visit_date"]
-        fixture = canonical_fixture(question(record, 1410))
-        candidates = [key for key, game in games.items() if game.date == day and (not fixture or game.fixture == fixture)]
-        if len(candidates) == 1:
-            assignments[record["internal_id"]] = candidates[0]
+        if parsed:
+            candidates = matching_game_ids(parsed, games)
         else:
-            assignments[record["internal_id"]] = None
+            fixture = canonical_fixture(question(record, 1410))
+            game = Game(record["_visit_date"], "", fixture)
+            candidates = (matching_game_ids(game, games, allow_reverse=True) if fixture else
+                          [key for key, other in games.items() if other.date == game.date])
+        assignments[record["internal_id"]] = candidates[0] if len(candidates) == 1 else None
     return assignments
 
 
@@ -983,19 +1050,16 @@ def prepare_plan(audit_bytes: bytes, previous_bytes: bytes) -> Plan:
         record["_provider_conflict"] = len(providers) > 1
         records.append(record)
     order_providers = {order: next(iter(providers)) if len(providers) == 1 else "" for order, providers in evidence.items()}
-    games = {}
-    for record in records:
-        game = game_from_visit_info(record.get("visit_info", ""))
-        if game:
-            games[game.id] = game
-    # Auditors' fixture answers are a fallback when no scheduled fixture exists.
-    for record in records:
-        if game_from_visit_info(record.get("visit_info", "")):
-            continue
-        fixture = canonical_fixture(question(record, 1410))
-        if re.search(r"\S\s+v\s+\S", fixture) and not any(g.date == record["_visit_date"] and g.fixture == fixture for g in games.values()):
-            game = Game(record["_visit_date"], "", fixture); games[game.id] = game
+    games = collect_games(records)
     main_refs, amazon_refs = reference_table(book, "Store Code"), reference_table(book, "Amazon Store Code")
+    # Use the export's city for new/incomplete reference entries. Look across
+    # all rows so an empty city on one audit does not hide it on another.
+    # Conflicting cities remain blank for review instead of choosing arbitrarily.
+    export_cities = collections.defaultdict(dict)
+    for raw in rows:
+        city = clean(raw.get("site_city"))
+        if city:
+            export_cities[clean(raw.get("site_code"))].setdefault(city.casefold(), city)
     references = {}
     for record in records:
         code = clean(record["site_code"])
@@ -1004,29 +1068,15 @@ def prepare_plan(audit_bytes: bytes, previous_bytes: bytes) -> Plan:
         if existing_ref and clean(existing_ref.get("city")) and clean(existing_ref.get("priority")):
             continue
         reference = existing_ref or {}
-        references.setdefault(code, {"code": code, "priority": clean(reference.get("priority")) or clean(fallback.get("priority")) or "Medium", "city": clean(reference.get("city")) or clean(fallback.get("city")), "name": record.get("site_name", ""), "address": record.get("site_address_1", ""), "postcode": record.get("site_post_code", ""), "site_id": clean(record["site_internal_id"]), "row": existing_ref["row"] if existing_ref else None})
+        cities = export_cities.get(code, {})
+        export_city = next(iter(cities.values())) if len(cities) == 1 else ""
+        references.setdefault(code, {"code": code, "priority": clean(reference.get("priority")) or clean(fallback.get("priority")) or "Medium", "city": clean(reference.get("city")) or export_city or clean(fallback.get("city")), "name": record.get("site_name", ""), "address": record.get("site_address_1", ""), "postcode": record.get("site_post_code", ""), "site_id": clean(record["site_internal_id"]), "row": existing_ref["row"] if existing_ref else None})
     dates = [parse_date(cumulative.get(row, 15)).isoformat() for row in cumulative_rows]
     dates += [r["_visit_date"] for r in records]
     result = Plan(records, games, skipped, duplicates, order_providers, list(references.values()), len(cumulative_rows), len(amazon_rows), min(dates) if dates else dt.date.today().isoformat())
     book.archive.close(); book.loaded.clear()
     return result
 
-
-def read_site_cities(content: bytes):
-    rows = read_csv_bytes(content)
-    if rows and not {"internal_id", "city"}.issubset(rows[0]):
-        raise ReportError("The site export must contain internal_id and city columns.")
-    by_id, codes = {}, collections.defaultdict(set)
-    for row in rows:
-        city = clean(row.get("city"))
-        if city:
-            site_id = clean(row.get("internal_id"))
-            if site_id in by_id and by_id[site_id] != city:
-                raise ReportError(f"The site export contains conflicting cities for {site_id}.")
-            by_id[site_id] = city
-            if clean(row.get("code")):
-                codes[clean(row["code"])].add(city)
-    return by_id, {code: next(iter(cities)) for code, cities in codes.items() if len(cities) == 1}
 
 
 MAIN_QUESTIONS = [1, 303, 5475, 5476, 92, 228, 580, 5493, 5469, 579, 5470, 5471, 5472, 1410, 329, 3006, 3007, 5473, 1910, 1911, 3017, 3009, 3008, 314, 5642, 340, 320, 1919, 321, 585, 328, 333, 5491, 1411, 589, 3014, 1412, 3015, 3019, 3016, 337, 338, 345, 1912, 1913, 1914, 5474, 23, 614, 616]
@@ -1278,7 +1328,7 @@ def email_text(book: Book, new_tnt: list[dict], folder_link: str, report_date: d
     lines += [f"{parse_date(day):%d/%m} – {rate(day)}" for day in periods]
     if not periods:
         lines.append("No new TNT audits were added this week.")
-    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues."]
+    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues.", "", "Kind Regards,"]
     return "\n".join(lines)
 
 
@@ -1473,7 +1523,7 @@ def main():
     st.caption("Upload the audit export and previous LIVE report, assign competitions, then generate both reports.")
     left, right = st.columns(2)
     audit_file = left.file_uploader("Audit export", type=["csv"], help="Both old and new export formats are supported.")
-    previous_file = right.file_uploader("Previous LIVE report", type=["xlsx"])
+    previous_file = right.file_uploader("Previous LIVE report", type=["xlsx"], help="Use the corrected 26 October LIVE report for the first run.")
     if audit_file is None or previous_file is None:
         return
     audit_bytes, previous_bytes = audit_file.getvalue(), previous_file.getvalue()
@@ -1484,17 +1534,14 @@ def main():
         return threading.Lock()
 
     @st.cache_data(show_spinner=False, max_entries=2)
-    def cached_plan(audits, previous):
+    def cached_plan(audits, previous, plan_version):
         with generation_lock():
             return prepare_plan(audits, previous)
 
-    @st.cache_data(show_spinner=False, max_entries=2)
-    def cached_cities(content):
-        return read_site_cities(content)
-
     try:
         with st.spinner("Reading the uploaded files…"):
-            plan = cached_plan(audit_bytes, previous_bytes)
+            # Version the cached plan when import or fixture grouping rules change.
+            plan = cached_plan(audit_bytes, previous_bytes, 3)
     except (ReportError, ValueError, ET.ParseError, KeyError, zipfile.BadZipFile) as error:
         st.error(str(error)); return
     a, b, c = st.columns(3)
@@ -1542,24 +1589,7 @@ def main():
         roots = {key: merge_root(key, merges) for key in ordered}
     except ReportError as error:
         st.error(str(error)); return
-    reference_rows = []
-    site_digest = "none"
-    if plan.references:
-        reference_rows = [dict(r) for r in plan.references]
-        need_city = any(not clean(r["city"]) for r in reference_rows)
-        site_digest = "none"
-        if need_city:
-            site_file = st.file_uploader("Site export", type=["csv"], help="Needed only for missing reference cities. The city column supplies the report's county field.", key="site_export_" + digest)
-            if site_file is not None:
-                try:
-                    site_bytes = site_file.getvalue()
-                    by_id, by_code = cached_cities(site_bytes)
-                    site_digest = hashlib.sha256(site_bytes).hexdigest()[:8]
-                    for reference in reference_rows:
-                        if not clean(reference["city"]):
-                            reference["city"] = by_id.get(reference["site_id"]) or by_code.get(reference["code"], "")
-                except ReportError as error:
-                    st.error(str(error)); return
+    reference_rows = [dict(reference) for reference in plan.references]
     # Submit the entire configuration together, including the active editor cell.
     with st.form("report_configuration_" + digest):
         assignments = assign_games(plan.records, games)
@@ -1618,10 +1648,10 @@ def main():
         reference_overrides = {}
         if plan.references:
             st.subheader("Store references")
-            st.caption("New priorities default to Medium. Override the priority or complete a missing city below.")
+            st.caption("Cities are filled from the audit export where available. New priorities default to Medium. Override the priority or complete a missing city below.")
             priority_values = st.session_state.setdefault("priority_values_" + digest, {})
             table = pd.DataFrame([{"Code": r["code"], "Site": r["name"], "Priority": priority_values.get(r["code"], r["priority"]), "City": r["city"]} for r in reference_rows])
-            editor_key = "references_" + digest + site_digest
+            editor_key = "references_v2_" + digest
             table = st.session_state.setdefault(editor_key + "_base", table)
             edited = st.data_editor(table, hide_index=True, use_container_width=True, disabled=["Code", "Site"], column_config={"Priority": st.column_config.TextColumn("Priority", required=True), "City": st.column_config.TextColumn("City", required=True)}, key=editor_key)
             reference_overrides = {r["Code"]: {"priority": clean(r["Priority"]), "city": clean(r["City"])} for r in edited.to_dict("records")}
