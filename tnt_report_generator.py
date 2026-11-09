@@ -1523,7 +1523,7 @@ def main():
     st.caption("Upload the audit export and previous LIVE report, assign competitions, then generate both reports.")
     left, right = st.columns(2)
     audit_file = left.file_uploader("Audit export", type=["csv"], help="Both old and new export formats are supported.")
-    previous_file = right.file_uploader("Previous LIVE report", type=["xlsx"], help="Use the corrected 26 October LIVE report for the first run.")
+    previous_file = right.file_uploader("Previous LIVE report", type=["xlsx"])
     if audit_file is None or previous_file is None:
         return
     audit_bytes, previous_bytes = audit_file.getvalue(), previous_file.getvalue()
