@@ -1328,7 +1328,7 @@ def email_text(book: Book, new_tnt: list[dict], folder_link: str, report_date: d
     lines += [f"{parse_date(day):%d/%m} – {rate(day)}" for day in periods]
     if not periods:
         lines.append("No new TNT audits were added this week.")
-    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues.", "", "Kind Regards,"]
+    lines += ["", f"SEASON TOTAL – {rate()}", "", "Let me know if you have any issues."]
     return "\n".join(lines)
 
 
